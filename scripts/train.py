@@ -9,6 +9,7 @@ import torch.multiprocessing
 # torch.multiprocessing.set_sharing_strategy("file_system")
 torch.set_float32_matmul_precision("medium")
 
+import random
 import hashlib
 import json
 import logging
@@ -208,13 +209,32 @@ class WrappedLightningModule(pl.LightningModule):
         self.max_epochs = max_epochs
         self.div_upweight = div_upweight
 
-    def _common_step(self, batch, eps=torch.finfo(torch.float32).eps):
+    def _common_step(self, batch, eps=torch.finfo(torch.float32).eps, do_ssl=False):
+        print("doing common step")
         feats = batch["features"]
         coords = batch["coords"]
         A = batch["assoc_matrix"]
         timepoints = batch["timepoints"]
         padding_mask = batch["padding_mask"]
         padding_mask = padding_mask.bool()
+
+        print("feats shape", feats.shape)
+
+        if do_ssl:
+            print("DOING SSL!")
+            preserved_feats = feats.clone()
+            _, N, _ = feats.shape
+            masked = [random.uniform(0,1) > 0.3 for x in range(N)]
+            feats[:, masked, :] = self.model.MASKED_TOKEN_INDICATOR
+
+            a, b = self.model(coords, feats, padding_mask=padding_mask, do_ssl=True)
+
+            loss = torch.nn.MSELoss()(a[:, masked], preserved_feats[:, masked])
+
+            print(a.shape, b.shape)
+            return {"loss": loss, "padding_fraction": 0}
+
+
 
         A_pred = self.model(coords, feats, padding_mask=padding_mask)
         # remove inf values that might happen due to float16 numerics
@@ -329,8 +349,9 @@ class WrappedLightningModule(pl.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        out = self._common_step(batch)
+        out = self._common_step(batch, do_ssl=(random.uniform(0,1) > (1-args.do_ssl_frac)))
         loss = out["loss"]
+        print(loss.item())
         if torch.isnan(loss):
             print("NaN loss, skipping")
             return None
@@ -1095,6 +1116,7 @@ def parse_train_args():
         help="config file path",
         default="configs/vanvliet.yaml",
     )
+    parser.add_argument("-s", "--do_ssl_frac", type=float, default=0.0)
     parser.add_argument("-o", "--outdir", type=str, default="runs")
     parser.add_argument("--name", type=str, help="Name to append to timestamp")
     parser.add_argument("--timestamp", type=str2bool, default=True)

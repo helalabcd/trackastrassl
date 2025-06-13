@@ -10,6 +10,7 @@ import torch
 # from torch_geometric.nn import GATv2Conv
 import yaml
 from torch import nn
+import torch.nn.functional as F
 
 # NoPositionalEncoding,
 from trackastra.utils import blockwise_causal_norm
@@ -307,6 +308,11 @@ class TrackingTransformer(torch.nn.Module):
         # self.window = window
         # self.feat_dim = feat_dim
         # self.coord_dim = coord_dim
+        
+        self.ssl_task_indicator = nn.Parameter(torch.randn(1, 1, 7))
+        self.track_task_indicator = nn.Parameter(torch.randn(1, 1, 7))
+        self.MASKED_TOKEN_INDICATOR = nn.Parameter(torch.randn(1, 1, 7))
+
 
         self.proj = nn.Linear(
             (1 + coord_dim) * pos_embed_per_dim + feat_dim * feat_embed_per_dim, d_model
@@ -363,8 +369,27 @@ class TrackingTransformer(torch.nn.Module):
 
         # self.pos_embed = NoPositionalEncoding(d=pos_embed_per_dim * (1 + coord_dim))
 
-    def forward(self, coords, features=None, padding_mask=None):
+    def forward(self, coords, features=None, padding_mask=None, do_ssl=False):
         assert coords.ndim == 3 and coords.shape[-1] in (3, 4)
+
+        """ BEGIN SSL HACK INJECT """
+        # Extend padding mask with FALSE to include the task indicator token
+        padding_mask = F.pad(padding_mask, (1, 0), "constant", 0)  # (pad_left=1, pad_right=0)
+        prefix = coords[:, :1, :]
+        coords = torch.cat([prefix, coords], dim=1)
+        
+        bs = features.shape[0]
+        if do_ssl:
+            print("Doing task SSL")
+            ssl_task_indicator_repeated = self.ssl_task_indicator.repeat(bs, 1, 1)
+            features = torch.cat((self.ssl_task_indicator, features), axis=1)
+        else:
+            print("Doing tracking task!")
+            track_task_indicator_repeated = self.track_task_indicator.repeat(bs, 1, 1)
+
+            features = torch.cat((track_task_indicator_repeated, features), axis=1)
+        """ END SSL HACK INJECT """
+
         _B, _N, _D = coords.shape
 
         # disable padded coords (such that it doesnt affect minimum)
@@ -383,7 +408,7 @@ class TrackingTransformer(torch.nn.Module):
         else:
             features = self.feat_embed(features)
             features = torch.cat((pos, features), axis=-1)
-
+        
         features = self.proj(features)
         features = self.norm(features)
 
@@ -398,9 +423,12 @@ class TrackingTransformer(torch.nn.Module):
         for dec in self.decoder:
             y = dec(y, x, coords=coords, padding_mask=padding_mask)
             # y = dec(y, y, coords=coords, padding_mask=padding_mask)
+        
+        if do_ssl:
+            return x, y
 
-        x = self.head_x(x)
-        y = self.head_y(y)
+        x = self.head_x(x[:, 1:])
+        y = self.head_y(y[:, 1:])
 
         # outer product is the association matrix (logits)
         A = torch.einsum("bnd,bmd->bnm", x, y)
