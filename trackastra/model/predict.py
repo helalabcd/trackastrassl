@@ -17,6 +17,45 @@ logger.setLevel(logging.INFO)
 
 
 def predict(batch, model):
+    """Predict association scores between objects in a batch.
+    
+    Args:
+        batch: Dictionary containing:
+            - features: Object features array
+            - coords: Object coordinates array
+            - timepoints: Time points array
+        model: TrackingTransformer model to use for prediction.
+    
+    Returns:
+        Array of association scores between objects.
+    """
+    feats = batch["features"]
+    coords = batch["coords"]
+    timepoints = batch["timepoints"].long()
+    # Hack that assumes that all parameters of a model are on the same device
+    device = next(model.parameters()).device
+    feats = feats.unsqueeze(0).to(device)
+    timepoints = timepoints.unsqueeze(0).to(device)
+    coords = coords.unsqueeze(0).to(device)
+
+    # Concat timepoints to coordinates
+    coords = torch.cat((timepoints.unsqueeze(2).float(), coords), dim=2)
+    with torch.no_grad():
+        A = model(coords, features=feats)
+        A = model.normalize_output(A, timepoints, coords)
+
+        # # Spatially far entries should not influence the causal normalization
+        # dist = torch.cdist(coords[0, :, 1:], coords[0, :, 1:])
+        # invalid = dist > model.config["spatial_pos_cutoff"]
+        # A[invalid] = -torch.inf
+
+        A = A.squeeze(0).detach().cpu().numpy()
+
+    return A
+
+
+
+def old_predict(batch, model):
     """Args:
         batch (_type_): _description_
         model (_type_): _description_.
@@ -24,9 +63,13 @@ def predict(batch, model):
     Returns:
         _type_: _description_
     """
-    feats = torch.from_numpy(batch["features"])
-    coords = torch.from_numpy(batch["coords"])
-    timepoints = torch.from_numpy(batch["timepoints"]).long()
+    #feats = torch.from_numpy(batch["features"])
+    #coords = torch.from_numpy(batch["coords"])
+    #timepoints = torch.from_numpy(batch["timepoints"]).long()
+    feats = batch["features"]
+    coords = batch["coords"]
+    timepoints = batch["timepoints"].long()
+
     # Hack that assumes that all parameters of a model are on the same device
     device = next(model.parameters()).device
     feats = feats.unsqueeze(0).to(device)

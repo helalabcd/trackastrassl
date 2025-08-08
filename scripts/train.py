@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from timeit import default_timer
+import time
 
 import configargparse
 import git
@@ -210,7 +211,11 @@ class WrappedLightningModule(pl.LightningModule):
         self.div_upweight = div_upweight
 
     def _common_step(self, batch, eps=torch.finfo(torch.float32).eps, do_ssl=False):
+        
+
         print("doing common step")
+        
+
         feats = batch["features"]
         coords = batch["coords"]
         A = batch["assoc_matrix"]
@@ -349,7 +354,55 @@ class WrappedLightningModule(pl.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        out = self._common_step(batch, do_ssl=(random.uniform(0,1) > (1-args.do_ssl_frac)))
+
+        # 1) Lazy‐init our batch‐stealers on first call
+        if not hasattr(self, "val_iter"):
+            # grab the train‐loader iterator
+            self.train_iter = iter(self.trainer.train_dataloader)
+            # grab whatever val loader(s) we have
+            vl = self.trainer.val_dataloaders
+            # if it's not a list, assume it's one DataLoader
+            if isinstance(vl, DataLoader):
+                val_loader = vl
+            else:
+                # Lightning sometimes gives you a list of DataLoaders
+                val_loader = vl[0]
+            self.val_iter = iter(val_loader)
+
+        # 2) Decide SSL vs “normal”
+        do_ssl = (random.random() < args.do_ssl_frac)
+
+        # 3) Pick the “real” batch
+        if do_ssl:
+            print("Not replacing anything")
+            actual_batch = batch
+        else:
+            try:
+                actual_batch = next(self.val_iter)
+                print("replaced batch with validation batch")
+            except StopIteration:
+                print("StopIteration")
+                # ran out of val data—start over
+                # (re‐grab the loader in case something changed)
+                vl = self.trainer.val_dataloaders
+                val_loader = vl if isinstance(vl, DataLoader) else vl[0]
+                self.val_iter = iter(val_loader)
+                actual_batch = next(self.val_iter)
+
+
+
+        device = self.device  # LightningModule already tracks the right device
+
+        actual_batch = self.transfer_batch_to_device(
+            actual_batch,
+            self.device,
+            dataloader_idx=0,
+        )
+
+
+        batch = actual_batch
+
+        out = self._common_step(batch, do_ssl=do_ssl)
         loss = out["loss"]
         print(loss.item())
         if torch.isnan(loss):
@@ -553,6 +606,12 @@ class ExampleImages(pl.pytorch.callbacks.Callback):
         self.mode = mode
         self.cmap = random_label_cmap()
 
+    def on_fit_start(self) -> None:
+        # now self.trainer is available, dataloaders are built
+        self.train_iter = iter(self.trainer.train_dataloader)
+        self.val_iter   = iter(self.trainer.val_dataloaders[0])
+
+
     def on_train_start(self, trainer, pl_module):
         start = default_timer()
 
@@ -560,6 +619,9 @@ class ExampleImages(pl.pytorch.callbacks.Callback):
             dataset = trainer.train_dataloader.dataset.datasets[0]
         else:
             dataset = trainer.train_dataloader.dataset
+
+        self.train_iter = iter(self.trainer.train_dataloader)
+        self.val_iter   = iter(self.trainer.val_dataloaders[0])
 
         for n in range(min(self._n_samples, len(dataset))):
             sample = dataset.__getitem__(n, return_dense=True)
@@ -662,10 +724,11 @@ def create_run_name(args):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     # name = f"{timestamp}_{args.name}_feats_{args.features}_pos_{args.attn_positional_bias}_causal_norm_{args.causal_norm}"
     if args.timestamp:
-        name = f"{timestamp}_{args.name}"
+        name = f"{args.name}"
     else:
         name = args.name
-    return name
+    return args.config.split(".")[0]
+    return args.name
 
 
 def cache_class(cachedir=None):
@@ -749,6 +812,8 @@ def find_val_batch(loader_val, n_gpus):
 def _init_wandb(project, name, config):
     _ = wandb.init(project=project, name=name, config=config)
 
+
+global datasets
 
 def train(args):
     args.seed = seed(args.seed)
